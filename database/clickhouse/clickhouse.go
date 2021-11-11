@@ -168,8 +168,13 @@ func (ch *ClickHouse) Version() (int, bool, error) {
 	var (
 		version int
 		dirty   uint8
-		query   = "SELECT version, dirty FROM `" + ch.config.MigrationsTable + "` ORDER BY sequence DESC LIMIT 1"
+		query   string
 	)
+	if len(ch.config.ClusterName) > 0 {
+		query = "SELECT version, dirty FROM `distributed_" + ch.config.MigrationsTable + "` ORDER BY sequence DESC LIMIT 1"
+	} else {
+		query = "SELECT version, dirty FROM `" + ch.config.MigrationsTable + "` ORDER BY sequence DESC LIMIT 1"
+	}
 	if err := ch.conn.QueryRow(query).Scan(&version, &dirty); err != nil {
 		if err == sql.ErrNoRows {
 			return database.NilVersion, false, nil
@@ -192,8 +197,12 @@ func (ch *ClickHouse) SetVersion(version int, dirty bool) error {
 	if err != nil {
 		return err
 	}
-
-	query := "INSERT INTO " + ch.config.MigrationsTable + " (version, dirty, sequence) VALUES (?, ?, ?)"
+	var query string
+	if len(ch.config.ClusterName) > 0 {
+		query = "INSERT INTO distributed_" + ch.config.MigrationsTable + " (version, dirty, sequence) VALUES (?, ?, ?)"
+	} else {
+		query = "INSERT INTO " + ch.config.MigrationsTable + " (version, dirty, sequence) VALUES (?, ?, ?)"
+	}
 	if _, err := tx.Exec(query, version, bool(dirty), time.Now().UnixNano()); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -220,29 +229,25 @@ func (ch *ClickHouse) ensureVersionTable() (err error) {
 	}()
 
 	var (
-		table string
-		query = "SHOW TABLES FROM " + ch.config.DatabaseName + " LIKE '" + ch.config.MigrationsTable + "'"
+		distributedTableQuery string
+		query                 = "SHOW TABLES FROM " + ch.config.DatabaseName + " LIKE '" + ch.config.MigrationsTable + "'"
 	)
-	// check if migration table exists
-	if err := ch.conn.QueryRow(query).Scan(&table); err != nil {
-		if err != sql.ErrNoRows {
-			return &database.Error{OrigErr: err, Query: []byte(query)}
-		}
-	} else {
-		return nil
-	}
 
 	// if not, create the empty migration table
 	if len(ch.config.ClusterName) > 0 {
 		query = fmt.Sprintf(`
-			CREATE TABLE %s ON CLUSTER %s (
+			CREATE TABLE IF NOT EXISTS %s ON CLUSTER %s (
+				ts         DateTime(3) DEFAULT now(),
 				version    Int64,
 				dirty      UInt8,
 				sequence   UInt64
-			) Engine=%s`, ch.config.MigrationsTable, ch.config.ClusterName, ch.config.MigrationsTableEngine)
+			) Engine=%s PARTITION BY toYYYYMM(ts) ORDER BY sequence;`, ch.config.MigrationsTable, ch.config.ClusterName, ch.config.MigrationsTableEngine)
+		distributedTableQuery = fmt.Sprintf(`CREATE TABLE  IF NOT EXISTS distributed_%s ON CLUSTER %s AS %s.%s
+            ENGINE = Distributed(%s, %s, %s, rand());`, ch.config.MigrationsTable, ch.config.ClusterName, ch.config.DatabaseName, ch.config.MigrationsTable,
+			ch.config.ClusterName, ch.config.DatabaseName, ch.config.MigrationsTable)
 	} else {
 		query = fmt.Sprintf(`
-			CREATE TABLE %s (
+			CREATE TABLE IF NOT EXISTS %s (
 				version    Int64,
 				dirty      UInt8,
 				sequence   UInt64
@@ -250,11 +255,17 @@ func (ch *ClickHouse) ensureVersionTable() (err error) {
 	}
 
 	if strings.HasSuffix(ch.config.MigrationsTableEngine, "Tree") {
-		query = fmt.Sprintf(`%s ORDER BY sequence`, query)
+		query = fmt.Sprintf(`%s PARTITION BY toYYYYMM(ts) ORDER BY sequence`, query)
 	}
-
+	fmt.Println(query)
+	fmt.Println(distributedTableQuery)
 	if _, err := ch.conn.Exec(query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+	if len(distributedTableQuery) > 0 {
+		if _, err := ch.conn.Exec(distributedTableQuery); err != nil {
+			return &database.Error{OrigErr: err, Query: []byte(query)}
+		}
 	}
 	return nil
 }
